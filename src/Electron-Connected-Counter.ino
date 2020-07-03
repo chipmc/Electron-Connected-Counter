@@ -1,8 +1,8 @@
 /*
-* Project Cellular-MMA8452Q - converged software for Low Power and Solar
+* Project Electron Connected Counter - converged software for Low Power and Solar
 * Description: Cellular Connected Data Logger for Utility and Solar powered installations
 * Author: Chip McClelland
-* Date:10 January 2018
+* Date:July 2nd 2020
 */
 
 /*  The idea of this release is to use the new sensor model which should work with multiple sensors
@@ -12,37 +12,15 @@
     enabling sleep  2) Low Battery Mode - reduced functionality to preserve battery charge
 */
 
-//v1    - Adapted from the Particle Electron version Cellular Pressure next
-//v1.01 - Added code for daylight savings time
-//v1.02 - Added the currentHourlyPeriod variable
-//v1.03 - Need to fix reporting that is not aligning with the hour
-//v2.00 - Updated to new deivceOS and implemented checking for sysStatus
-//v2.01 - Minor fixes, removed deep sleep (need to switch to RTC), controlled sysStatus.connectedStatus
-//v2.02 - Working on making sleep mode work.  24 hour operations require close time to 24.
-//v2.03 - Rewrote the Ubidots handler, fixed some minor errors, added time offset string
-//v2.04 - Updated the PMIC stuff
-//v2.05 - Fixed bug in main loop - not resetting FRAM write needed flags
-//v2.06 - Moved to deviceOS@1.5.0-rc2 and updated libraries
-//v2.07 - Improved time keeping
-//v2.08 - Sleep 2.0
-//v3.01 - Added support for battery context and the Ubidots Webhook to report it.
-//v3.02 - Issue which prevents charging.
-//v3.03 - Trying to revert to PMIC for Solar
-//v3.10 - Updated the power management function to move back to the new setPowerConfiguration Api
-//v3.11 - Minor fix to charge current for the non-solar use case
-//v3.12 - Trying a lower value for solar charge 4208
-//v3.13 - Added instructions to explicitly tell the device to charge
-//v3.14 - Added debugging code
-//v4.00 - Fixed issue where counts are not zeroed if the device does not sleep at night (zero counts at mighnight skipped reset)
-//v5.00 - Took out debugging code
-//v5.01 - Added code to put timestamp on hourly events, Moved to 2nd Tire Counting
-//v6.00 - Moved to the Async Particle Publish Library
+//v15.00    - Adapted from the Boron Connected Counter Baseline
+//v15.02 - Used atomic variables to support both structures and updating counts in the ISR
+
 
 // Particle Product definitions
-PRODUCT_ID(10864);                                  // Boron Connected Counter Header
-PRODUCT_VERSION(6);
+PRODUCT_ID(4441);                                  // Boron Connected Counter Header
+PRODUCT_VERSION(15);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="6.00";
+char currentPointRelease[6] ="15.02";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -83,22 +61,26 @@ struct currentCounts_structure {                    // currently 10 bytes long
   int maxMinValue;                                  // Highest count in one minute in the current period
 } current;
 
+// Atomic vairables - values are set and get atomically for use with ISR
+std::atomic<uint32_t> hourlyAtomic;
+std::atomic<uint32_t> dailyAtomic;
+
 // Included Libraries
-#include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
-#include "MCP79410RK.h"                             // Real Time Clock
+#include "electrondoc.h"                            // Pinout Documentation File
 #include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
 #include "UnitTestCode.h"                           // This code will exercise the device
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
+#include <atomic>
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
 SYSTEM_THREAD(ENABLED);                             // Means my code will not be held up by Particle processes.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 Api
-MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 retained uint8_t publishQueueRetainedBuffer[2048];
 PublishQueueAsync publishQueue(publishQueueRetainedBuffer, sizeof(publishQueueRetainedBuffer));
+void sensorISR();
 
 // State Maching Variables
 enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, REPORTING_STATE, RESP_WAIT_STATE };
@@ -107,15 +89,17 @@ State state = INITIALIZATION_STATE;
 State oldState = INITIALIZATION_STATE;
 
 // Pin Constants - Boron Carrier Board v1.2a
-const int tmp36Pin =      A4;                       // Simple Analog temperature sensor
-const int wakeUpPin =     D8;                       // This is the Particle Electron WKP pin
-const int donePin =       D5;                       // Pin the Electron uses to "pet" the watchdog
+const int tmp36Pin =      A0;                       // Simple Analog temperature sensor
+const int wakeUpPin =     A7;                       // This is the Particle Electron WKP pin
+const int tmp36Shutdwn =  B5;                       // Can turn off the TMP-36 to save energy
+const int hardResetPin =  D4;                       // Power Cycles the Electron and the Carrier Board
+const int donePin =       D6;                       // Pin the Electron uses to "pet" the watchdog
 const int blueLED =       D7;                       // This LED is on the Electron itself
-const int userSwitch =    D4;                       // User switch with a pull-up resistor
+const int userSwitch =    D5;                       // User switch with a pull-up resistor
 // Pin Constants - Sensor
-const int intPin =        SCK;                      // Pressure Sensor inerrupt pin
-const int disableModule = MOSI;                     // Bringining this low turns on the sensor (pull-up on sensor board)
-const int ledPower =      MISO;                     // Allows us to control the indicator LED on the sensor board
+const int intPin =        B1;                       // Pressure Sensor inerrupt pin
+const int disableModule = B2;                       // Bringining this low turns on the sensor (pull-up on sensor board)
+const int ledPower =      B4;                       // Allows us to control the indicator LED on the sensor board
 
 // Timing Variables
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
@@ -155,6 +139,8 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
   pinMode(donePin,OUTPUT);                          // Allows us to pet the watchdog
+  pinResetFast(hardResetPin);
+  pinMode(hardResetPin,OUTPUT);                     // For a hard reset active HIGH
 
   // Pressure / PIR Module Pin Setup
   pinMode(intPin,INPUT_PULLDOWN);                   // pressure sensor interrupt
@@ -187,7 +173,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextStr);
 
-
   Particle.function("resetFRAM", resetFRAM);                          // These are the functions exposed to the mobile app and console
   Particle.function("resetCounts",resetCounts);
   Particle.function("HardReset",hardResetNow);
@@ -208,9 +193,7 @@ void setup()                                        // Note: Disconnected Setup(
   if (tempVersion != FRAMversionNumber) {                             // Check to see if the memory map in the sketch matches the data on the chip
     fram.erase();                                                     // Reset the FRAM to correct the issue
     fram.put(FRAM::versionAddr, FRAMversionNumber);                   // Put the right value in
-    fram.get(FRAM::versionAddr, tempVersion);                         // See if this worked
-    if (tempVersion != FRAMversionNumber) state = ERROR_STATE;        // Device will not work without FRAM
-    else loadSystemDefaults();                                        // Out of the box, we need the device to be awake and connected
+    loadSystemDefaults();                                        // Out of the box, we need the device to be awake and connected
   }
   else fram.get(FRAM::systemStatusAddr,sysStatus);                    // Loads the System Status array from FRAM
 
@@ -223,17 +206,13 @@ void setup()                                        // Note: Disconnected Setup(
 
   (sysStatus.lowPowerMode) ? strcpy(lowPowerModeStr,"True") : strcpy(lowPowerModeStr,"False");
 
-  rtc.setup();                                                        // Start the real time clock
-  rtc.clearAlarm();                                                   // Ensures alarm is still not set from last cycle
-
   Time.setDSTOffset(sysStatus.dstOffset);                              // Set the value from FRAM if in limits
-  if (!Time.isValid()) Time.setTime(rtc.getRTCTime());
   DSTRULES() ? Time.beginDST() : Time.endDST();    // Perform the DST calculation here
   Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
 
   // Done with the System Stuff - now load the current counts
-  fram.get(FRAM::currentCountsAddr,current);
+  fram.get(FRAM::currentCountsAddr, current);
   if (current.hourlyCount) currentHourlyPeriod = Time.hour(current.lastCountTime);
   else currentHourlyPeriod = Time.hour();                              // The local time hourly period for reporting purposes
 
@@ -253,6 +232,8 @@ void setup()                                        // Note: Disconnected Setup(
 
   if ((Time.hour() >= sysStatus.closeTime || Time.hour() < sysStatus.openTime)) {} // The park is closed - don't connect
   else {                                                              // Park is open let's get ready for the day
+    hourlyAtomic.store(0,std::memory_order_relaxed);
+    dailyAtomic.store(0,std::memory_order_relaxed);
     attachInterrupt(intPin, sensorISR, RISING);                       // Pressure Sensor interrupt from low to high
     if (sysStatus.connectedStatus && !Particle.connected()) connectToParticle(); // Only going to connect if we are in connectionMode
     takeMeasurements();                                               // Populates values so you can read them before the hour
@@ -264,6 +245,7 @@ void setup()                                        // Note: Disconnected Setup(
   if (state == INITIALIZATION_STATE) state = IDLE_STATE;              // IDLE unless otherwise from above code
 
   digitalWrite(blueLED,LOW);
+
 }
 
 void loop()
@@ -303,7 +285,7 @@ void loop()
     digitalWrite(blueLED,LOW);                                        // Turn off the LED
     petWatchdog();
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
-    rtc.setAlarm(wakeInSeconds);                                // The Real Time Clock will turn the Enable pin back on to wake the device
+    System.sleep(SLEEP_MODE_DEEP,wakeInSeconds);                      // Very deep sleep until the next hour
     } break;
 
   case NAPPING_STATE: {  // This state puts the device in low power mode quickly
@@ -335,8 +317,6 @@ void loop()
       resetTimeStamp = millis();
       state = ERROR_STATE;
     }
-  
-    if (sysStatus.lowPowerMode) Time.setTime(rtc.getRTCTime());
     break;
 
   case RESP_WAIT_STATE:
@@ -367,7 +347,7 @@ void loop()
         delay(2000);
         sysStatus.resetCount = 0;                                  // Zero the ResetCount
         systemStatusWriteNeeded=true;
-        rtc.setAlarm(10);
+        digitalWrite(hardResetPin,HIGH);                              // This will cut all power to the Electron AND the carrier board
       }
       else {                                                          // If we have had 3 resets - time to do something more
         if (Particle.connected()) publishQueue.publish("State","Error State - Full Modem Reset", PRIVATE);            // Brodcase Reset Action
@@ -379,7 +359,6 @@ void loop()
     }
     break;
   }
-  rtc.loop();                                                         // keeps the clock up to date
   //sensorDetect = steadyCountTest();                                     // Comment out to cause the device to run through a series of tests
   
 }
@@ -397,8 +376,8 @@ void recordCount() // This is where we check to see if an interrupt is set when 
   current.maxMinValue++;
 
   current.lastCountTime = Time.now();
-  current.hourlyCount++;                                                // Increment the PersonCount
-  current.dailyCount++;                                                 // Increment the PersonCount
+  current.hourlyCount += hourlyAtomic.fetch_and(0,std::memory_order_relaxed);   // Increment the hourlyCount from the atomic variable
+  current.dailyCount += dailyAtomic.fetch_and(0,std::memory_order_relaxed);    // Increment the dailyCount from the atomic vairable
   if (sysStatus.verboseMode && Particle.connected()) {
     char data[256];                                                    // Store the date in this character array - not global
     snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
@@ -417,7 +396,7 @@ void sendEvent() {
   int secondsPastHour = timeStampValue % 3600;
   timeStampValue = timeStampValue - (secondsPastHour + 1);            // This ensures that the midnight report is back-dated 5 minutes 
   snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i,  \"key1\":\"%s\", \"temp\":%i, \"resets\":%i, \"alerts\":%i, \"maxmin\":%i, \"timestamp\":%lu000}",current.hourlyCount, current.dailyCount, sysStatus.stateOfCharge, batteryContextStr, current.temperature, sysStatus.resetCount, current.alertCount, current.maxMinValue, timeStampValue);
-  publishQueue.publish("Ubidots-Counter-Hook-v1", data, PRIVATE);
+  publishQueue.publish("Electron-Connected-Counter-Ubidots", data, PRIVATE);
   dataInFlight = true;                                                // set the data inflight flag
   webhookTimeStamp = millis();
   currentHourlyPeriod = Time.hour();
@@ -495,6 +474,8 @@ void sensorISR()
   static bool frontTireFlag = false;
   if (frontTireFlag) {
     sensorDetect = true;                              // sets the sensor flag for the main loop
+    hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
+    dailyAtomic.fetch_add(1, std::memory_order_relaxed);
     frontTireFlag = false;
   }
   else frontTireFlag = true;
@@ -570,7 +551,6 @@ void loadSystemDefaults() {                                         // Default s
   sysStatus.dstOffset = 1;
   sysStatus.openTime = 0;
   sysStatus.closeTime = 24;
-
   fram.put(FRAM::systemStatusAddr,sysStatus);                       // Write it now since this is a big deal and I don't want values over written
 }
 
@@ -661,13 +641,13 @@ int resetCounts(String command)                                       // Resets 
   else return 0;
 }
 
-int hardResetNow(String command)                                      // Will perform a hard reset on the Electron
-{
+int hardResetNow(String command)   {                                    // Will perform a hard reset on the Electron
   if (command == "1")
   {
-    publishQueue.publish("Reset","Hard Reset in 2 seconds",PRIVATE);
-    rtc.setAlarm(10);
-    return 1;                                                         // Unfortunately, this will never be sent
+    publishQueue.publish("Reset","Hard Reset in 2 seconds",PRIVATE, WITH_ACK);
+    delay(2000);
+    digitalWrite(hardResetPin,HIGH);                                    // This will cut all power to the Electron AND the carrir board
+    return 1;                                                           // Unfortunately, this will never be sent
   }
   else return 0;
 }
@@ -816,15 +796,15 @@ void publishStateTransition(void)
   Serial.println(stateTransitionString);
 }
 
-void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/electronsample
-	Particle.disconnect(); 	                                         // Disconnect from the cloud
-	unsigned long startTime = millis();  	                           // Wait up to 15 seconds to disconnect
+void fullModemReset() {                                                 // Adapted form Rikkas7's https://github.com/rickkas7/electronsample
+	Particle.disconnect(); 	                                              // Disconnect from the cloud
+	unsigned long startTime = millis();  	                                // Wait up to 15 seconds to disconnect
 	while(Particle.connected() && millis() - startTime < 15000) {
 		delay(100);
 	}
 	// Reset the modem and SIM card
 	// 16:MT silent reset (with detach from network and saving of NVM parameters), with reset of the SIM card
-	Cellular.command(30000, "AT+CFUN=15\r\n");
+	Cellular.command(30000, "AT+CFUN=16\r\n");
 	delay(1000);
 	// Go into deep sleep for 10 seconds to try to reset everything. This turns off the modem as well.
 	System.sleep(SLEEP_MODE_DEEP, 10);
